@@ -367,72 +367,133 @@ def ReconHAAR(kspc, csm, reg_list, itmethod='POGM', it=10, Lc=1., device='cuda',
     return X
 
 
-def ReconHAAR_CORE(y, csm, gStp,  mu1, mu2, lam1, lam2, oIter=10, iIter=10,device='cuda',verbose=0, stopth=1e-3):
-    """
-    Perform CORE based reconstruction.
-    Reference : https://github.com/OSU-MR/motion-robust-CMR
-    """
-    Nv, Nt, Nc, FE, PE, SPE = y.shape
-    y = torch.as_tensor(np.ascontiguousarray(y)).to(torch.complex64).to(device)
-    csm = torch.as_tensor(np.ascontiguousarray(csm)).to(torch.complex64).to(device)
-    us_mask = (torch.abs(y[:, :, 0:1, FE // 2:FE // 2 + 1]) > 0).to(torch.float32).to(device)
-    print("LOAD KSPC SHAPE", y.shape, "LOAD CSM SHAPE", csm.shape, 'US RATE:', 1/torch.mean(us_mask))
-    rcomb = torch.sum(k2i_torch(y, ax=[-3, -2, -1]) * torch.conj(csm), -4)
-    regFactor = torch.max(torch.abs(rcomb))
-    y /= regFactor
-    A = Eop(csm, us_mask)
-    u = A.mtimes(y, 1)
-    loss_prev = None
-    v = torch.zeros_like(y).flatten()
-    d1 = torch.zeros((2 ** 4, Nv,Nt, FE, PE, SPE)).to(torch.complex64).to(device)
+def ReconHAAR_CORE(params):
+    torch.backends.cudnn.benchmark = True 
+    torch.autograd.profiler.emit_nvtx(enabled=True) 
+    torch.set_num_threads(os.cpu_count())
+    def shrink1(s, alph, p, ep=1e-10):
+        t = torch.abs(s)
+        if isinstance(alph, torch.Tensor):
+            if alph.dim() < s.dim():
+                num_new_dims = s.dim() - alph.dim()
+                view_shape = [-1] + [1] * num_new_dims
+                alph = alph.view(*view_shape)
+        scale = torch.clamp_min(t - alph * (t ** 2 + ep) ** (p / 2 - 0.5), 0)
+        w = scale * (s / (t + ep)) 
+        return w
+
+    def HAAR4D(X, scale=1 / 2, forward=True, device='cuda'):
+        if forward:
+            FE, PE, SPE, Nt = X.shape
+            X = X.view(FE, PE, SPE, Nt)
+            sign = [-1, 1]
+
+            FE, PE, SPE, Nt = X.shape
+            sign_comb = torch.tensor(list(itertools.product([-1, 1], repeat=4)), device=device)
+            d1, d2, d3, d4 = sign_comb.unbind(dim=1)
+            X = X.unsqueeze(0)  
+            d1 = d1.view(-1, 1, 1, 1, 1) 
+            d2 = d2.view(-1, 1, 1, 1, 1)
+            d3 = d3.view(-1, 1, 1, 1, 1)
+            d4 = d4.view(-1, 1, 1, 1, 1)
+
+            tmp = scale * (X + d1 * torch.roll(X, shifts=-1, dims=1))
+            tmp1 = scale * (tmp + d2 * torch.roll(tmp, shifts=-1, dims=2))
+            tmp = scale * (tmp1 + d3 * torch.roll(tmp1, shifts=-1, dims=3))
+            y = scale * (tmp + d4 * torch.roll(tmp, shifts=-1, dims=4))
+
+            return y
+        else:
+            Ch, FE, PE, SPE, Nt = X.shape
+
+            sign_comb = torch.tensor(list(itertools.product([-1, 1], repeat=4)), device=device)
+            d1, d2, d3, d4 = sign_comb.unbind(dim=1) 
+
+            d1 = d1.view(-1, 1, 1, 1, 1)  
+            d2 = d2.view(-1, 1, 1, 1, 1)
+            d3 = d3.view(-1, 1, 1, 1, 1)
+            d4 = d4.view(-1, 1, 1, 1, 1)
+
+            tmp = scale * (X + d1 * torch.roll(X, shifts=1, dims=1))
+            tmp1 = scale * (tmp + d2 * torch.roll(tmp, shifts=1, dims=2))
+            tmp = scale * (tmp1 + d3 * torch.roll(tmp1, shifts=1, dims=3))
+            y = scale * (tmp + d4 * torch.roll(tmp, shifts=1, dims=4))
+            y = torch.sum(y, 0) 
+            return y
+
+    y = params['K']
+    A = params['op']
+    oIter = params['oit']
+    iIter = params['iit']
+    gStp = params['gstp']
+    mu1 = params['mu1']
+    mu2 = params['mu2']
+    lam2 = params['lam2']
+    dev = params['device']
+    lam1 = torch.from_numpy(params['lam1']).to(device=dev, dtype=torch.float32)
+    FE, PE, SPE, Nc, Nt = y.shape
+
+    print(dev, y.shape)
+    if 'u' in params.keys():
+        print("USE U ")
+        u = params['u']
+    else:
+        u = A.mtimes(y, 1)
+
+    v = torch.zeros_like(y).contiguous()
+    d1 = torch.zeros((16, FE, PE, SPE, Nt)).to(torch.complex64).to(dev)
     b1 = d1.clone()
-    d2 = v.clone()
-    b2 = v.clone()
-    loop = tqdm.tqdm(range(1, oIter + 1), total=oIter)
-    for i in loop:
-        if verbose:
-            print(" ")
+    d2 = v.reshape(-1).clone()
+    b2 = v.reshape(-1).clone()
+    v = v.contiguous()
+    for i in range(oIter):
         for j in range(iIter):
-            gradA = 2 * A.mtimes((A.mtimes(u, 0) + v.reshape(Nv, Nt, Nc, FE, PE, SPE) - y), 1)
-            gradW = mu1 * HAAR4D((HAAR4D(u, forward=True, device=device) - d1.reshape(16, Nv, Nt, FE, PE, SPE) + b1.reshape(16,Nv,Nt,FE,PE,SPE)),
-                                 forward=False, device=device)
+            gradA = 2 * A.mtimes((A.mtimes(u, 0) + v.reshape(FE, PE, SPE, Nc, Nt) - y), 1)
+            gradW = mu1 * HAAR4D((HAAR4D(u, forward=True, device=dev) - d1.reshape(16, FE,
+                                                                                                               PE, SPE,
+                                                                                                               Nt) + b1.reshape(
+                16,
+
+                FE,
+                PE,
+                SPE,
+                Nt)),
+                                 forward=False, device=dev)
             u -= gStp * (gradA + gradW)
 
         Au = A.mtimes(u, 0)
         for j in range(iIter):
-            gradA = Au + v.reshape(Nv, Nt, Nc, FE, PE, SPE) - y
+            gradA = Au + v.reshape(FE, PE, SPE, Nc, Nt) - y
             v = v.reshape(FE, -1)
-            gradW = mu2 * (v.flatten() - (d2 - b2) * (
-                        v / (torch.sqrt(torch.sum(torch.abs(v) ** 2, axis=0)) + 1e-6)).flatten())
-            v = v.flatten() - gStp * (gradA.flatten() + gradW)
+            gradW = mu2 * (v.reshape(-1) - (d2 - b2) * (
+                    v / (torch.sqrt(torch.sum(torch.abs(v) ** 2, axis=0)) + 1e-6)).reshape(-1))
+            v = v.reshape(-1) - gStp * (gradA.reshape(-1) + gradW)
         del gradA
         del gradW
-        Wdecu = HAAR4D(u, forward=True, device=device)
-        for ind in range(16):
-            d1[ind] = shrink1(Wdecu[ind] + b1[ind], lam1[ind] / mu1, 1)
+        # Update auxiliary variables
+        Wdecu = HAAR4D(u, forward=True, device=dev)
+
+        d1 = shrink1(Wdecu + b1, lam1 / mu1, 1)
+
         b1 += (Wdecu - d1)
         v = v.reshape(FE, -1)
         b2 = b2.reshape(FE, -1)
-        d2 = shrink1(torch.sqrt(torch.sum(torch.abs(v) ** 2, axis=0)) + b2, lam2 / mu2, 1)
-        b2 += (torch.sqrt(torch.sum(torch.abs(v) ** 2, axis=0)) - d2)
-        b2 = b2.flatten()
-        d2 = d2.flatten()
-        v = v.flatten()
-        objW = 0
-        objA = 0.5 * torch.sum(torch.abs(Au + v.reshape(Nv, Nt, Nc, FE, PE, SPE) - y) ** 2)
-        for k in range(16):
-            objW += torch.sum(torch.abs(lam1[k] * Wdecu.view(16, -1)[k]))
-        objV = torch.sum(lam2 * torch.sqrt(torch.sum(torch.abs(v.view(FE, -1)) ** 2, dim=1)))
+        v_norm = torch.linalg.norm(v, dim=0, ord=2) 
+        d2 = shrink1(v_norm + b2, lam2 / mu2, 1)
+        b2 += (v_norm - d2)
+        b2 = b2.reshape(-1)
+        d2 = d2.reshape(-1)
+        objA = 0.5 * torch.sum(torch.abs(Au + v.reshape(FE, PE, SPE, Nc, Nt) - y) ** 2)
+        objW = torch.sum(torch.abs(lam1.reshape(16, -1) * Wdecu.reshape(16, -1)))
+        objV = torch.sum(lam2 * torch.sqrt(torch.sum(torch.abs(v.reshape(FE, -1)) ** 2, dim=1)))
         obj = objA + objW + objV
-        loop.set_postfix({'obj': '{:.5f}'.format(obj.item()), 'objA': '{:.5f}'.format(objA), 'objW': '{:.5f}'.format(objW),'objV': '{:.5f}'.format(objV)})  
+
+        print(
+            f'CORe: Iter = {i} \tobjA= {objA.item():.2f}\tobjW= {objW.item():.2f}\tobjv= {objV.item():.2f}\ttotal_obj= {obj.item():.2f}\t')
+
         del Au
         del Wdecu
-        if loss_prev is not None:
-            relerr = np.abs(obj.item() - loss_prev) / np.abs(loss_prev)
-            if np.abs(relerr) < stopth:
-                break
-        loss_prev = obj.item()
 
-    return u, v
 
+    return u.cpu().numpy(), v.view(FE, PE, SPE, Nc, Nt).cpu().numpy()
 
